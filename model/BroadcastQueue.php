@@ -149,10 +149,10 @@ class BroadcastQueue
     public static function getJobs(int $limit = 20, array $allowedDomains = [], bool $globalAdmin = true, string $username = ''): array
     {
         $jobTable = table_by_key('broadcast_job');
-        $limit = max(1, min($limit, 100));
-        $queryLimit = $globalAdmin ? $limit : max($limit * 10, 100);
-        $queryLimit = min($queryLimit, 500);
-        $jobs = db_query_all("SELECT * FROM $jobTable ORDER BY id DESC LIMIT $queryLimit");
+        $limit = max(0, min($limit, 100));
+        $queryLimit = $globalAdmin ? $limit : min(max($limit * 10, 100), 500);
+        $limitSql = $limit === 0 ? '' : " LIMIT $queryLimit";
+        $jobs = db_query_all("SELECT * FROM $jobTable ORDER BY id DESC$limitSql");
         $visibleJobs = [];
 
         foreach ($jobs as $job) {
@@ -163,7 +163,7 @@ class BroadcastQueue
             $job['status_label'] = self::statusLabel($job['status']);
             $visibleJobs[] = $job;
 
-            if (count($visibleJobs) >= $limit) {
+            if ($limit !== 0 && count($visibleJobs) >= $limit) {
                 break;
             }
         }
@@ -373,14 +373,7 @@ class BroadcastQueue
         $jobTable = table_by_key('broadcast_job');
         $domainTable = table_by_key('broadcast_job_domain');
         $recipientTable = table_by_key('broadcast_recipient');
-        $params = [];
-        $activeWhere = db_in_clause('status', self::activeStatuses(), $params);
-
-        if ($globalAdmin) {
-            $jobs = db_query_all("SELECT id FROM $jobTable WHERE NOT ($activeWhere)", $params);
-        } else {
-            $jobs = self::getJobs(100, $allowedDomains, false, $username);
-        }
+        $jobs = self::getJobs(0, $allowedDomains, $globalAdmin, $username);
 
         $jobIds = [];
         foreach ($jobs as $job) {
@@ -394,14 +387,22 @@ class BroadcastQueue
             return;
         }
 
-        $params = [];
-        $jobWhere = db_in_clause('job_id', $jobIds, $params);
-        db_execute("DELETE FROM $recipientTable WHERE $jobWhere", $params);
-        db_execute("DELETE FROM $domainTable WHERE $jobWhere", $params);
+        $pdo = db_connect();
+        $pdo->beginTransaction();
+        try {
+            $params = [];
+            $jobWhere = db_in_clause('job_id', $jobIds, $params);
+            db_execute("DELETE FROM $recipientTable WHERE $jobWhere", $params, true);
+            db_execute("DELETE FROM $domainTable WHERE $jobWhere", $params, true);
 
-        $params = [];
-        $idWhere = db_in_clause('id', $jobIds, $params);
-        db_execute("DELETE FROM $jobTable WHERE $idWhere", $params);
+            $params = [];
+            $idWhere = db_in_clause('id', $jobIds, $params);
+            db_execute("DELETE FROM $jobTable WHERE $idWhere", $params, true);
+            $pdo->commit();
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
+        }
     }
 
     public static function recoverInterrupted(int $jobId): void
@@ -414,15 +415,24 @@ class BroadcastQueue
         if (empty($interrupted)) {
             return;
         }
-        db_execute(
-            "UPDATE $recipientTable SET status = 'unknown', error = :error, modified = " . self::nowSql() . " WHERE job_id = :job_id AND status = 'sending'",
-            ['job_id' => $jobId, 'error' => 'Submission interrupted; check SMTP logs before deciding whether to resend']
-        );
+        $pdo = db_connect();
+        $pdo->beginTransaction();
+        try {
+            db_execute(
+                "UPDATE $recipientTable SET status = 'unknown', error = :error, modified = " . self::nowSql() . " WHERE job_id = :job_id AND status = 'sending'",
+                ['job_id' => $jobId, 'error' => 'Submission interrupted; check SMTP logs before deciding whether to resend'],
+                true
+            );
+            self::updateCounters($jobId, true);
+            $pdo->commit();
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
+        }
         foreach ($interrupted as $recipient) {
             $reference = $recipient['smtp_response'] ?: 'no Message-ID recorded';
             error_log("PostfixAdmin broadcast: job $jobId recipient {$recipient['id']} ($reference) has an unknown SMTP result; check SMTP logs before any manual retry");
         }
-        self::updateCounters($jobId);
     }
 
     public static function processNext(int $limit = 50, ?bool $dryRun = null, ?int $jobId = null): array
@@ -462,19 +472,27 @@ class BroadcastQueue
             $recipientId = (int)$item['id'];
             $recipient = $item['recipient'];
             $messageId = '<broadcast-' . $jobId . '-' . $recipientId . '-' . bin2hex(random_bytes(8)) . '@' . php_uname('n') . '>';
-            db_execute("UPDATE $recipientTable SET status = 'sending', smtp_response = :message_id, modified = " . self::nowSql() . " WHERE id = :id", ['id' => $recipientId, 'message_id' => 'Message-ID: ' . $messageId]);
+            db_execute("UPDATE $recipientTable SET status = 'sending', smtp_response = :message_id, modified = " . self::nowSql() . " WHERE id = :id", ['id' => $recipientId, 'message_id' => 'Message-ID: ' . $messageId], true);
 
             $ok = $dryRun ? true : self::sendRecipient($job, $recipient, $messageId);
-            if ($ok) {
-                db_execute("UPDATE $recipientTable SET status = 'sent', smtp_response = :response, sent_at = " . self::nowSql() . ", modified = " . self::nowSql() . " WHERE id = :id", ['id' => $recipientId, 'response' => ($dryRun ? 'dry-run; ' : 'accepted by SMTP; ') . 'Message-ID: ' . $messageId]);
-                $sent++;
-            } else {
-                db_execute("UPDATE $recipientTable SET status = 'failed', error = :error, modified = " . self::nowSql() . " WHERE id = :id", ['id' => $recipientId, 'error' => 'SMTP submission failed']);
-                $failed++;
+            $pdo = db_connect();
+            $pdo->beginTransaction();
+            try {
+                if ($ok) {
+                    db_execute("UPDATE $recipientTable SET status = 'sent', smtp_response = :response, sent_at = " . self::nowSql() . ", modified = " . self::nowSql() . " WHERE id = :id", ['id' => $recipientId, 'response' => ($dryRun ? 'dry-run; ' : 'accepted by SMTP; ') . 'Message-ID: ' . $messageId], true);
+                } else {
+                    db_execute("UPDATE $recipientTable SET status = 'failed', error = :error, modified = " . self::nowSql() . " WHERE id = :id", ['id' => $recipientId, 'error' => 'SMTP submission failed'], true);
+                }
+                self::updateCounters($jobId, true);
+                $pdo->commit();
+            } catch (Throwable $e) {
+                $pdo->rollBack();
+                throw $e;
             }
 
             $processed++;
-            self::updateCounters($jobId);
+            $sent += (int)$ok;
+            $failed += (int)!$ok;
         }
 
         $freshJob = self::getJob($jobId);
@@ -518,9 +536,17 @@ class BroadcastQueue
         $recipientTable = table_by_key('broadcast_recipient');
 
         self::recoverInterrupted($jobId);
-        db_execute("UPDATE $recipientTable SET status = 'cancelled', modified = " . self::nowSql() . " WHERE job_id = :job_id AND status = 'pending'", ['job_id' => $jobId]);
-        self::updateCounters($jobId);
-        db_execute("UPDATE $jobTable SET status = 'cancelled', finished = " . self::nowSql() . ", modified = " . self::nowSql() . " WHERE id = :id", ['id' => $jobId]);
+        $pdo = db_connect();
+        $pdo->beginTransaction();
+        try {
+            db_execute("UPDATE $recipientTable SET status = 'cancelled', modified = " . self::nowSql() . " WHERE job_id = :job_id AND status = 'pending'", ['job_id' => $jobId], true);
+            self::updateCounters($jobId, true);
+            db_execute("UPDATE $jobTable SET status = 'cancelled', finished = " . self::nowSql() . ", modified = " . self::nowSql() . " WHERE id = :id", ['id' => $jobId], true);
+            $pdo->commit();
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
+        }
     }
 
     private static function finishIfDone(int $jobId): void

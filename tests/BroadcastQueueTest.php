@@ -131,6 +131,49 @@ class BroadcastQueueTest extends \PHPUnit\Framework\TestCase
         $this->assertSame('cancelled', BroadcastQueue::getRecipients($jobId)[0]['status']);
     }
 
+    public function testResetInactiveRollsBackAllDeletesOnFailure(): void
+    {
+        if (!db_sqlite()) {
+            $this->markTestSkipped('SQLite failure injection');
+        }
+
+        $this->createDomain($this->domains[0]);
+        $jobId = BroadcastQueue::createJob(
+            'admin@example.test', 'noreply@example.test', 'PostfixAdmin', 'Rollback', 'Body',
+            [$this->domains[0]], true, ["one@{$this->domains[0]}"]
+        );
+        $jobTable = table_by_key('broadcast_job');
+        $domainTable = table_by_key('broadcast_job_domain');
+        db_execute("UPDATE $jobTable SET status = 'finished' WHERE id = :id", ['id' => $jobId], true);
+        db_connect()->exec("CREATE TRIGGER reject_broadcast_domain_delete BEFORE DELETE ON $domainTable BEGIN SELECT RAISE(ABORT, 'test rollback'); END");
+
+        try {
+            $this->expectException(PDOException::class);
+            BroadcastQueue::resetInactive();
+        } finally {
+            db_connect()->exec('DROP TRIGGER reject_broadcast_domain_delete');
+            $this->assertNotEmpty(BroadcastQueue::getJob($jobId));
+            $this->assertCount(1, BroadcastQueue::getRecipients($jobId));
+            $this->assertCount(1, BroadcastQueue::getJobDomains($jobId));
+        }
+    }
+
+    public function testResetInactiveIncludesJobsBeyondDisplayLimit(): void
+    {
+        $this->createDomain($this->domains[0]);
+        $jobTable = table_by_key('broadcast_job');
+        for ($i = 0; $i < 101; $i++) {
+            $jobId = BroadcastQueue::createJob(
+                'admin@example.test', 'noreply@example.test', 'PostfixAdmin', 'Old job', 'Body',
+                [$this->domains[0]], true, ["one@{$this->domains[0]}"]
+            );
+            db_execute("UPDATE $jobTable SET status = 'finished' WHERE id = :id", ['id' => $jobId], true);
+        }
+
+        BroadcastQueue::resetInactive($this->domains, false, 'admin@example.test');
+        $this->assertSame([], BroadcastQueue::getJobs(0));
+    }
+
     public function testCancellationKeepsInterruptedSubmissionUnconfirmed(): void
     {
         $this->createDomain($this->domains[0]);
