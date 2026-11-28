@@ -10,16 +10,7 @@ set_exception_handler(function ($exception) {
         // Apache replaces the status line with "500 Internal Server Error".
         // Always HTTP/1.1: mod_php only applies a status line starting with "HTTP/1.".
         header('HTTP/1.1 419 Page Expired', true, 419);
-        $title = Config::lang('session_expired_title') ?: 'Session expired';
-        $message = Config::lang('session_expired_message') ?: 'The page token is no longer valid. Please return and try again.';
-        $button = Config::lang('session_expired_button') ?: 'Continue';
-
-        echo "<!doctype html>\n";
-        echo "<html><head><meta charset=\"utf-8\"><title>" . htmlentities($title) . "</title></head><body>\n";
-        echo "<p><strong>" . htmlentities($title) . "</strong></p>\n";
-        echo "<p>" . htmlentities($message) . "</p>\n";
-        echo "<p><a href=\"main.php\">" . htmlentities($button) . "</a></p>\n";
-        echo "</body></html>\n";
+        require __DIR__ . '/../templates/session-expired.php';
         exit(0);
     }
 
